@@ -1,0 +1,240 @@
+# LEARNING OBJECTIVE:
+# Understand fundamental TCP socket programming in Python to build a simple multi-player client-server
+# number guessing game. This tutorial demonstrates server setup, client connection,
+# multi-threading for concurrent client handling, and basic message exchange.
+
+import socket
+import threading
+import random
+import sys # Used for command-line arguments and graceful exit
+
+# --- Server Configuration ---
+SERVER_HOST = '127.0.0.1'  # Standard loopback interface address (localhost)
+SERVER_PORT = 12345        # Port for the server to listen on (non-privileged ports are > 1023)
+SECRET_NUMBER = random.randint(1, 100) # The random number players need to guess
+CONNECTED_CLIENTS = []     # A list to keep track of all connected client sockets and their names
+CLIENT_LOCK = threading.Lock() # A lock to synchronize access to shared resources like the client list
+
+# This function defines how the server communicates with a single connected client.
+def handle_client(client_socket, addr):
+    # Debug message indicating a new connection
+    print(f"DEBUG: New connection from {addr}")
+    client_name = "" # Initialize client_name, will be set by the client
+
+    try:
+        # First, ask the client for their name
+        client_socket.sendall(b"Welcome to Guess The Number! Please enter your name: ")
+        name_data = client_socket.recv(1024).decode().strip() # Receive the name
+        if not name_data:
+            print(f"DEBUG: Client {addr} disconnected before naming.")
+            return # Exit if no name is provided or client disconnects immediately
+
+        client_name = name_data
+        print(f"DEBUG: Client {client_name} ({addr}) joined.")
+        
+        # Add this client to our shared list, ensuring thread-safe access with a lock
+        with CLIENT_LOCK:
+            CONNECTED_CLIENTS.append((client_socket, client_name))
+        
+        # Broadcast to all clients that a new player has joined
+        broadcast_message(f"SERVER: {client_name} has joined the game!")
+        client_socket.sendall(b"Guess a number between 1 and 100.\n")
+
+        # Main loop for receiving guesses from this client
+        while True:
+            message = client_socket.recv(1024).decode().strip() # Read the client's guess
+            if not message: # If no message, client likely disconnected
+                break
+
+            print(f"DEBUG: {client_name} guessed: {message}")
+            try:
+                guess = int(message) # Convert guess to an integer
+                if not 1 <= guess <= 100:
+                    client_socket.sendall(b"Please guess a number between 1 and 100.\n")
+                    continue
+
+                # Check the guess against the secret number
+                if guess < SECRET_NUMBER:
+                    client_socket.sendall(b"Too low! Try again.\n")
+                elif guess > SECRET_NUMBER:
+                    client_socket.sendall(b"Too high! Try again.\n")
+                else:
+                    # Correct guess! Broadcast the win to all players.
+                    broadcast_message(f"SERVER: {client_name} guessed the number {SECRET_NUMBER} correctly! Game over!")
+                    print(f"DEBUG: Game ended. Secret number was {SECRET_NUMBER}")
+                    break # Exit this client's loop, ending their game session
+
+            except ValueError:
+                # Handle cases where the input is not a valid number
+                client_socket.sendall(b"Invalid input. Please enter a number.\n")
+
+    except ConnectionResetError:
+        print(f"DEBUG: Client {client_name} ({addr}) forcibly closed connection.")
+    except Exception as e:
+        # Catch any other unexpected errors during client handling
+        print(f"DEBUG: Error handling client {client_name} ({addr}): {e}")
+    finally:
+        # This block ensures cleanup happens whether or not an error occurred
+        with CLIENT_LOCK: # Protect the client list while modifying it
+            if (client_socket, client_name) in CONNECTED_CLIENTS:
+                CONNECTED_CLIENTS.remove((client_socket, client_name))
+        print(f"DEBUG: Client {client_name} ({addr}) disconnected.")
+        if client_name: # Only broadcast if the client successfully named themselves
+            broadcast_message(f"SERVER: {client_name} has left the game.")
+        client_socket.close() # Close the socket for this client
+
+# Helper function to send a message to all currently connected clients
+def broadcast_message(message):
+    with CLIENT_LOCK: # Protect the client list during iteration
+        for client_socket, _ in CONNECTED_CLIENTS:
+            try:
+                client_socket.sendall(f"{message}\n".encode()) # Send encoded message
+            except Exception as e:
+                print(f"DEBUG: Error broadcasting to a client (likely disconnected): {e}")
+                # The client might have disconnected, so we just log the error and continue
+
+# --- Server Main Logic ---
+def run_server():
+    # Create a TCP/IP socket: AF_INET for IPv4, SOCK_STREAM for TCP
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # SO_REUSEADDR allows the server to re-bind to the same address/port quickly after restarting
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        # Bind the socket to the specified host and port
+        server_socket.bind((SERVER_HOST, SERVER_PORT))
+        # Listen for incoming connections, allowing up to 5 connections to be queued
+        server_socket.listen(5) 
+        print(f"Server listening on {SERVER_HOST}:{SERVER_PORT}")
+        print(f"Secret number is: {SECRET_NUMBER}") # For server operator to know
+
+        # Infinite loop to continuously accept new client connections
+        while True:
+            # server_socket.accept() blocks until a new client tries to connect.
+            # It returns a new socket object for the client connection and the client's address.
+            client_socket, addr = server_socket.accept()
+            print(f"DEBUG: Accepted connection from {addr}")
+            # Start a new thread to handle this client. This allows the server to accept more clients
+            # concurrently without waiting for the current client's session to end.
+            client_handler = threading.Thread(target=handle_client, args=(client_socket, addr))
+            client_handler.daemon = True # Daemon threads exit automatically when the main program exits
+            client_handler.start() # Start the client handling thread
+
+    except KeyboardInterrupt:
+        print("\nServer shutting down due to user interrupt (Ctrl+C).")
+    except Exception as e:
+        print(f"An unexpected error occurred in the server: {e}")
+    finally:
+        server_socket.close() # Close the main server socket
+        # Attempt to gracefully close all connected client sockets upon server shutdown
+        with CLIENT_LOCK:
+            for client_socket, _ in CONNECTED_CLIENTS:
+                try:
+                    client_socket.sendall(b"SERVER: Server is shutting down. Goodbye!\n")
+                    client_socket.close()
+                except:
+                    pass # Ignore errors if client already disconnected
+        sys.exit(0) # Exit the server program
+
+# --- Client Main Logic ---
+def run_client():
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Create a TCP/IP client socket
+    try:
+        # Connect to the server using its host and port
+        client_socket.connect((SERVER_HOST, SERVER_PORT))
+        print(f"Connected to server at {SERVER_HOST}:{SERVER_PORT}")
+        
+        # This inner function will run in a separate thread to continuously receive messages from the server.
+        def receive_messages():
+            while True:
+                try:
+                    data = client_socket.recv(1024) # Receive up to 1024 bytes
+                    if not data: # If no data, the server likely closed the connection
+                        print("Server disconnected.")
+                        break
+                    print(f"\n{data.decode().strip()}") # Decode and print server message
+                    sys.stdout.flush() # Ensure the message is printed immediately
+                except Exception as e:
+                    print(f"Error receiving from server: {e}")
+                    break
+
+        # Start the thread for receiving messages from the server
+        receive_thread = threading.Thread(target=receive_messages, daemon=True)
+        receive_thread.start()
+
+        # Main loop for sending messages (user input/guesses) to the server
+        while True:
+            user_input = input("") # Get input from the user (e.g., their name or guess)
+            if user_input.lower() == 'exit': # Allow client to gracefully disconnect
+                break
+            client_socket.sendall(user_input.encode()) # Send the encoded input to the server
+
+    except ConnectionRefusedError:
+        print("Could not connect to the server. Is it running?")
+    except KeyboardInterrupt:
+        print("\nDisconnecting from server.")
+    except Exception as e:
+        print(f"An unexpected error occurred in the client: {e}")
+    finally:
+        client_socket.close() # Close the client socket
+        sys.exit(0) # Exit the client program
+
+# --- Example Usage Instructions ---
+# This block allows you to run either the server or client from the same script
+# by providing a command-line argument.
+if __name__ == "__main__":
+    # Example command to run the server: python your_script_name.py server
+    # Example command to run a client:  python your_script_name.py client
+    if len(sys.argv) != 2:
+        print("Usage: python script.py [server|client]")
+        sys.exit(1) # Exit with an error code
+
+    # Check the command-line argument to determine whether to run as server or client
+    if sys.argv[1].lower() == 'server':
+        run_server()
+    elif sys.argv[1].lower() == 'client':
+        run_client()
+    else:
+        print("Invalid argument. Use 'server' or 'client'.")
+        sys.exit(1) # Exit with an error code
+
+# --- Expected Console Output (Illustrative) ---
+#
+# Server Terminal:
+# Server listening on 127.0.0.1:12345
+# Secret number is: 50 (example, will be random)
+# DEBUG: Accepted connection from ('127.0.0.1', 54321)
+# DEBUG: New connection from ('127.0.0.1', 54321)
+# DEBUG: Client Alice (('127.0.0.1', 54321)) joined.
+# DEBUG: Client Alice guessed: 22
+# DEBUG: Accepted connection from ('127.0.0.1', 54322)
+# DEBUG: New connection from ('127.0.0.1', 54322)
+# DEBUG: Client Bob (('127.0.0.1', 54322)) joined.
+# DEBUG: Client Bob guessed: 75
+# SERVER: Bob guessed the number 50 correctly! Game over!
+# DEBUG: Game ended. Secret number was 50
+# DEBUG: Client Bob (('127.0.0.1', 54322)) disconnected.
+# SERVER: Bob has left the game.
+#
+# Client Terminal (e.g., 'Alice'):
+# Connected to server at 127.0.0.1:12345
+# Welcome to Guess The Number! Please enter your name: Alice
+#
+# Guess a number between 1 and 100.
+# 22
+# Too low! Try again.
+#
+# SERVER: Alice has joined the game!
+# 70
+# Too high! Try again.
+#
+# SERVER: Bob has joined the game!
+#
+# SERVER: Bob guessed the number 50 correctly! Game over!
+# Disconnecting from server.
+#
+# To run:
+# 1. Save the code as 'game.py'.
+# 2. Open one terminal and run the server:   python game.py server
+# 3. Open multiple other terminals and run clients: python game.py client
+# 4. Interact by entering names and guesses in the client terminals.
